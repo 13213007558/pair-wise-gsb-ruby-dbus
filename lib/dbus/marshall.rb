@@ -33,11 +33,12 @@ module DBus
     # Create a new unmarshaller for the given data *buffer*.
     # @param buffer [String]
     # @param endianness [:little,:big]
-    def initialize(buffer, endianness)
+    def initialize(buffer, endianness, unix_fds = nil)
       # TODO: this dup can be avoided if we can prove
       # that an IncompleteBufferException leaves the original *buffer* intact
       buffer = buffer.dup
       @raw_msg = RawMessage.new(buffer, endianness)
+      @unix_fds = unix_fds
     end
 
     # Unmarshall the buffer for a given _signature_ and length _len_.
@@ -72,6 +73,11 @@ module DBus
       @raw_msg.pos
     end
 
+    # Move to the start of the message body.
+    def seek(position)
+      @raw_msg.seek(position)
+    end
+
     private
 
     # @param data_class [Class] a subclass of Data::Base (specific?)
@@ -99,7 +105,11 @@ module DBus
 
       if data_class.fixed?
         value = aligned_read_value(data_class)
-        packet = data_class.from_raw(value, mode: mode)
+        packet = if data_class == Data::UnixFD
+                   data_class.from_raw(value, mode: mode, unix_fds: @unix_fds)
+                 else
+                   data_class.from_raw(value, mode: mode)
+                 end
       elsif data_class.basic?
         size = aligned_read_value(data_class.size_class)
         # @raw_msg.align(data_class.alignment)
@@ -169,10 +179,11 @@ module DBus
 
     # Create a new marshaller, setting the current packet to the
     # empty packet.
-    def initialize(offset = 0, endianness: HOST_ENDIANNESS)
+    def initialize(offset = 0, endianness: HOST_ENDIANNESS, unix_fds: nil)
       @endianness = endianness
       @packet = ""
       @offset = offset # for correct alignment of nested marshallers
+      @unix_fds = unix_fds || []
     end
 
     # Round _num_ up to the specified power of two, _alignment_
@@ -236,7 +247,17 @@ module DBus
       if data_class.fixed?
         align(data_class.alignment)
         data = data_class.new(val)
-        @packet += data.marshall(endianness)
+        if data_class == Data::UnixFD && data.value.is_a?(::IO)
+          io = data.value
+          index = @unix_fds.index { |existing| existing.fileno == io.fileno }
+          if index.nil?
+            index = @unix_fds.size
+            @unix_fds << io
+          end
+          @packet += Data::UInt32.new(index).marshall(endianness)
+        else
+          @packet += data.marshall(endianness)
+        end
       elsif data_class.basic?
         val = val.value if val.is_a?(Data::Basic)
         align(data_class.size_class.alignment)
@@ -314,7 +335,8 @@ module DBus
 
       append(Data::Signature.type, vartype.to_s)
       align(vartype.alignment)
-      sub = PacketMarshaller.new(@offset + @packet.bytesize, endianness: endianness)
+      sub = PacketMarshaller.new(@offset + @packet.bytesize, endianness: endianness,
+                                 unix_fds: @unix_fds)
       sub.append(vartype, vardata)
       @packet += sub.packet
     end

@@ -324,10 +324,41 @@ module DBus
       end
     end
 
-    # Unix file descriptor, not implemented yet.
+    # Unix file descriptor index on the wire. At the API level the value is
+    # an IO object; the marshaller assigns the wire index.
     class UnixFD < UInt32
       def self.type_code
         "h"
+      end
+
+      def self.from_raw(value, mode:, unix_fds: nil)
+        return super(value, mode: mode) if unix_fds.nil?
+
+        io = unix_fds[value]
+        raise InvalidPacketException, "UNIX_FD index #{value} is out of range" if io.nil?
+
+        return io if mode == :plain
+
+        new(io)
+      end
+
+      def initialize(value)
+        value = value.value if value.is_a?(self.class)
+        case value
+        when Integer
+          super
+        else
+          io = value.respond_to?(:to_io) ? value.to_io : value
+          raise TypeError, "expected an IO or Integer, got #{value.class}" unless io.is_a?(::IO)
+
+          @value = io
+        end
+      end
+
+      def marshall(endianness)
+        return super unless value.is_a?(::IO)
+
+        raise TypeException, "UNIX_FD IO objects are assigned by PacketMarshaller"
       end
     end
 

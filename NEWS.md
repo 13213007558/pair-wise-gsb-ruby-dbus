@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+Features:
+ * Complete UNIX_FD passing over negotiated UNIX socket connections.
+   Messages map "h" indexes to received IO objects and send SCM_RIGHTS
+   ancillary data; parsed messages own received FDs until closed or taken.
+
 ## Ruby D-Bus 0.25.0 - 2025-04-03
 
 Bug fixes:

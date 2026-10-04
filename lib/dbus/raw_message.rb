@@ -87,5 +87,11 @@ module DBus
         raise ArgumentError, "Unsupported alignment #{alignment}"
       end
     end
+
+    # Move the read cursor, used to continue parsing a message body after
+    # parsing its headers.
+    def seek(position)
+      @pos = position
+    end
   end
 end

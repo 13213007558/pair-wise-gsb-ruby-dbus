@@ -122,7 +122,6 @@ module DBus
     # Authenticates the connection before messages can be exchanged.
     class Client
       # @return [Boolean] have we negotiated Unix file descriptor passing
-      # NOTE: not implemented yet in upper layers
       attr_reader :unix_fd
 
       # @return [String]
@@ -169,6 +168,7 @@ module DBus
         raise AuthenticationFailed, command.first if @state == :TerminatedError
 
         send("BEGIN")
+        @unix_fd
       end
 
       ##########

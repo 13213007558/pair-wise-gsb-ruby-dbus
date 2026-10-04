@@ -77,6 +77,8 @@ module DBus
     attr_reader :serial
     # The parameters of the message.
     attr_reader :params
+    # @return [Array<IO>] UNIX file descriptors carried by this message
+    attr_reader :unix_fds
 
     # Create a message with message type _mtype_ with default values and a
     # unique serial number.
@@ -92,6 +94,8 @@ module DBus
         @@serial += 1
       end
       @params = []
+      @unix_fds = []
+      @owns_unix_fds = false
       @destination = nil
       @interface = nil
       @error_name = nil
@@ -134,9 +138,19 @@ module DBus
     end
 
     # Add a parameter _val_ of type _type_ to the message.
+    # For an outgoing UNIX_FD ("h"), the message borrows *val*; the sender
+    # retains ownership and must keep it open until {MessageQueue#push}.
     def add_param(type, val)
       type = type.chr if type.is_a?(Integer)
       @signature += type.to_s
+      if type.to_s == "h"
+        io = unix_fd_io(val)
+        unless io
+          raise ArgumentError, "UNIX_FD parameter must be an IO"
+        end
+
+        @unix_fds << io unless @unix_fds.any? { |fd| fd.fileno == io.fileno }
+      end
       @params << [type, val]
     end
 
@@ -157,6 +171,7 @@ module DBus
     DESTINATION = 6
     SENDER = 7
     SIGNATURE = 8
+    UNIX_FDS = 9
 
     RESERVED_PATH = "/org/freedesktop/DBus/Local"
 
@@ -164,18 +179,28 @@ module DBus
     # it in a packet form.
     # @return [String]
     def marshall
+      marshall_with_fds.first
+    end
+
+    # Marshall the message and return its bytes and the IO objects that must
+    # be sent as SCM_RIGHTS. SCM_RIGHTS duplicates the descriptors, so the
+    # sender retains and is responsible for closing the original objects.
+    # @return [Array(String,Array<IO>)]
+    def marshall_with_fds
+      ObjectSpace.undefine_finalizer(self)
       if @path == RESERVED_PATH
         # the bus would disconnect us, better explain why
         raise "Cannot send a message with the reserved path #{RESERVED_PATH}: #{inspect}"
       end
 
-      params_marshaller = PacketMarshaller.new(endianness: ENDIANNESS)
+      unix_fds = []
+      params_marshaller = PacketMarshaller.new(endianness: ENDIANNESS, unix_fds: unix_fds)
       @params.each do |type, value|
         params_marshaller.append(type, value)
       end
       @body_length = params_marshaller.packet.bytesize
 
-      marshaller = PacketMarshaller.new(endianness: ENDIANNESS)
+      marshaller = PacketMarshaller.new(endianness: ENDIANNESS, unix_fds: unix_fds)
       marshaller.append(Type::BYTE, ENDIANNESS_CHAR.ord)
       marshaller.append(Type::BYTE, @message_type)
       marshaller.append(Type::BYTE, @flags)
@@ -192,11 +217,14 @@ module DBus
       headers << [DESTINATION,  ["s", @destination]]  if @destination
       #           SENDER is not sent, the message bus fills it in instead
       headers << [SIGNATURE,    ["g", @signature]]    if @signature != ""
+      headers << [UNIX_FDS,     ["u", unix_fds.size]] if unix_fds.any?
       marshaller.append("a(yv)", headers)
 
       marshaller.align(8)
 
-      marshaller.packet + params_marshaller.packet
+      @unix_fds = unix_fds
+      @owns_unix_fds = false
+      [marshaller.packet + params_marshaller.packet, unix_fds]
     end
 
     # Unmarshall a packet contained in the buffer _buf_ and set the
@@ -205,7 +233,11 @@ module DBus
     # @return [Array(Message,Integer)]
     #   the detected message (self) and
     #   the index pointer of the buffer where the message data ended.
-    def unmarshall_buffer(buf)
+    def unmarshall_buffer(buf, unix_fds = nil)
+      ObjectSpace.undefine_finalizer(self)
+      @unix_fds = []
+      @owns_unix_fds = false
+      unix_fd_count = nil
       pu = PacketUnmarshaller.new(buf, RawMessage.endianness(buf[0]))
       mdata = pu.unmarshall(MESSAGE_SIGNATURE)
       _, @message_type, @flags, @protocol, @body_length, @serial,
@@ -229,13 +261,101 @@ module DBus
           @sender = struct[1]
         when SIGNATURE
           @signature = struct[1]
+        when UNIX_FDS
+          unix_fd_count = struct[1]
         end
       end
       pu.align_body
-      if @body_length.positive? && @signature
-        @params = pu.unmarshall(@signature, @body_length)
+      body_position = pu.consumed_size
+      if unix_fd_count
+        unix_fds ||= []
+        unless unix_fd_count == unix_fds.size
+          raise InvalidPacketException,
+                "UNIX_FDS header says #{unix_fd_count}, received #{unix_fds.size}"
+        end
+      elsif unix_fds && !unix_fds.empty?
+        raise InvalidPacketException, "received #{unix_fds.size} UNIX_FDs without UNIX_FDS header"
       end
-      [self, pu.consumed_size]
+      if @body_length.positive? && @signature
+        body_pu = PacketUnmarshaller.new(buf, RawMessage.endianness(buf[0]), unix_fds)
+        body_pu.seek(body_position)
+        @params = body_pu.unmarshall(@signature, @body_length)
+      elsif unix_fd_count.to_i.positive?
+        raise InvalidPacketException, "UNIX_FDS header present but message body has no UNIX_FD"
+      end
+      @unix_fds = (unix_fds || []).dup
+      @owns_unix_fds = true
+      define_unix_fd_finalizer
+      consumed_size = body_position + @body_length
+      consumed_size = pu.consumed_size if @body_length.zero?
+      [self, consumed_size]
+    end
+
+    # Close FDs still owned by this parsed message. A parsed message owns its
+    # received FDs until the application calls {#disown_unix_fds}.
+    def close_unix_fds
+      return unless @owns_unix_fds
+
+      ObjectSpace.undefine_finalizer(self)
+      @unix_fds.each { |io| io.close unless io.closed? }
+      @owns_unix_fds = false
+    end
+
+    # Transfer ownership of one FD (and the remaining FDs through
+    # {#disown_unix_fds}) to the caller. FDs not taken remain owned and are
+    # closed when the message is discarded.
+    def take_unix_fd(index)
+      io = @unix_fds[index]
+      raise IndexError if io.nil?
+      ObjectSpace.undefine_finalizer(self)
+      @unix_fds.delete(io)
+      @owns_unix_fds = @unix_fds.any?
+      define_unix_fd_finalizer if @owns_unix_fds
+      io
+    end
+
+    # Transfer ownership of this message's FDs to its caller. After this call
+    # the message and its finalizer will not close them.
+    def disown_unix_fds
+      ObjectSpace.undefine_finalizer(self)
+      @owns_unix_fds = false
+      @unix_fds
+    end
+
+    # Return the framed message size, or nil if the buffer is incomplete.
+    def self.frame_size(buf)
+      return nil if buf.bytesize < 16
+
+      endianness = RawMessage.endianness(buf[0])
+      format = Data::UInt32.format[endianness]
+      body_length = buf.byteslice(4, 4).unpack1(format)
+      header_array_length = buf.byteslice(12, 4).unpack1(format)
+      header_size = (16 + header_array_length + 7) & ~7
+      size = header_size + body_length
+      raise InvalidPacketException, "message too large (#{size} bytes)" if size > 134_217_728
+
+      return nil if buf.bytesize < size
+
+      size
+    end
+
+    def self.finalize_unix_fds(file_descriptors)
+      proc do
+        file_descriptors.each(&:close)
+      end
+    end
+
+    def define_unix_fd_finalizer
+      finalizer = self.class.send(:finalize_unix_fds, @unix_fds.dup)
+      ObjectSpace.define_finalizer(self, finalizer)
+    end
+
+    def unix_fd_io(value)
+      value = value.value if value.is_a?(Data::UnixFD)
+      return value if value.is_a?(::IO)
+      return value.to_io if value.respond_to?(:to_io)
+
+      nil
     end
 
     # Make a new exception from ex, mark it as being caused by this message

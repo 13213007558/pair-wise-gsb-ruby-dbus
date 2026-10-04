@@ -39,7 +39,7 @@ describe DBus::Authentication::Client do
         ["BEGIN\r\n"]
       ]
 
-      expect { subject.authenticate }.to_not raise_error
+      expect(subject.authenticate).to eq(false)
     end
   end
 
@@ -53,7 +53,7 @@ describe DBus::Authentication::Client do
         ["BEGIN\r\n"]
       ]
 
-      expect { subject.authenticate }.to_not raise_error
+      expect(subject.authenticate).to eq(true)
       expect(subject.address_uuid).to eq "ffffffffffffffffffffffffffffffff"
     end
 

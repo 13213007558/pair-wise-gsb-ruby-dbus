@@ -18,18 +18,31 @@ module DBus
     # The socket that is used to connect with the bus.
     attr_reader :socket
 
+    # @return [Boolean] whether UNIX_FD passing was negotiated
+    attr_reader :unix_fd
+
     # The buffer size for messages.
     MSG_BUF_SIZE = 4096
 
-    def initialize(address)
-      DBus.logger.debug "MessageQueue: #{address}"
-      @address = address
+    def initialize(address_or_socket, unix_fd: nil)
+      DBus.logger.debug "MessageQueue: #{address_or_socket}"
       @buffer = ""
       # Reduce allocations by using a single buffer for our socket
       @read_buffer = String.new(capacity: MSG_BUF_SIZE)
       @is_tcp = false
+      @unix_fd = false
+      @unix_fd_chunks = []
+      @stream_position = 0
       @mutex = Mutex.new
-      connect
+      if address_or_socket.is_a?(::IO)
+        @socket = address_or_socket
+        @unix_fd = unix_fd == true
+      else
+        @address = address_or_socket
+        connect
+      end
+      finalizer = self.class.send(:finalize_queue, @socket, @unix_fd_chunks)
+      ObjectSpace.define_finalizer(self, finalizer)
     end
 
     # @param blocking [Boolean]
@@ -59,12 +72,32 @@ module DBus
 
     def push(message)
       @mutex.synchronize do
-        @socket.write(message.marshall)
+        if message.unix_fds.any? && !@unix_fd
+          raise InvalidPacketException, "UNIX_FD passing was not negotiated"
+        end
+
+        packet, file_descriptors = message.marshall_with_fds
+        if file_descriptors.any?
+          control = Socket::AncillaryData.unix_rights(*file_descriptors)
+          @socket.sendmsg(packet, 0, nil, control)
+        else
+          @socket.write(packet)
+        end
       end
     end
     alias << push
 
+    def close
+      @mutex.synchronize { close_locked }
+    end
+
     private
+
+    def close_locked
+      ObjectSpace.undefine_finalizer(self)
+      close_pending_unix_fds
+      @socket.close unless @socket.closed?
+    end
 
     # Connect to the bus and initialize the connection.
     def connect
@@ -142,22 +175,40 @@ module DBus
     # Initialize the connection to the bus.
     def init_connection
       client = Authentication::Client.new(@socket)
-      client.authenticate
+      @unix_fd = client.authenticate
     end
 
     public # FIXME: fix Main loop instead
 
-    # Get and remove one message from the buffer.
+    # Get and remove one message from the buffer. The queue owns received FDs
+    # while the message is incomplete; a parsed message owns them afterwards.
+    # Malformed messages and EOF close all pending FDs.
     # @return [Message,nil] the message or nil if unavailable
     def message_from_buffer_nonblock
       return nil if @buffer.empty?
 
       ret = nil
+      file_descriptors = nil
       begin
-        ret, size = Message.new.unmarshall_buffer(@buffer)
+        size = Message.frame_size(@buffer)
+        return nil if size.nil?
+
+        file_descriptors = unix_fds_for_message(size)
+        ret, consumed = Message.new.unmarshall_buffer(@buffer, file_descriptors)
+        unless consumed == size
+          raise InvalidPacketException,
+                "consumed #{consumed} bytes from a #{size}-byte message"
+        end
         @buffer.slice!(0, size)
+        @stream_position += size
       rescue IncompleteBufferException
         # fall through, let ret remain nil
+      rescue Exception
+        close_unix_fds(file_descriptors) unless file_descriptors.nil?
+        close_pending_unix_fds
+        @buffer = ""
+        @stream_position = 0
+        raise
       end
       ret
     end
@@ -167,17 +218,67 @@ module DBus
     # @return [void]
     # @raise EOFError
     def buffer_from_socket_nonblock
-      @buffer += @socket.read_nonblock(MSG_BUF_SIZE, @read_buffer)
+      if @unix_fd
+        data, _address, _flags, control = @socket.recvmsg_nonblock(MSG_BUF_SIZE, scm_rights: true)
+        file_descriptors = if control && control.cmsg_is?(:SOCKET, :RIGHTS)
+                              control.unix_rights
+                            else
+                              []
+                            end
+        raise EOFError if (data.nil? || data.empty?) && file_descriptors.empty?
+
+        data = "" if data.nil?
+        @unix_fd_chunks << {
+          start: @stream_position + @buffer.bytesize,
+          fds: file_descriptors
+        }
+        @buffer += data
+      else
+        @buffer += @socket.read_nonblock(MSG_BUF_SIZE, @read_buffer)
+      end
     rescue EOFError
+      close_pending_unix_fds
       raise # the caller expects it
-    rescue Errno::EAGAIN
+    rescue Errno::EAGAIN, IO::WaitReadable
       # fine, would block
     rescue Exception => e
-      puts "Oops:", e
-      raise if @is_tcp # why?
+      raise if @unix_fd || @is_tcp
 
+      puts "Oops:", e
       puts "WARNING: read_nonblock failed, falling back to .recv"
       @buffer += @socket.recv(MSG_BUF_SIZE)
     end
+
+    def unix_fds_for_message(size)
+      message_end = @stream_position + size
+      file_descriptors = []
+      @unix_fd_chunks.reject! do |chunk|
+        next false unless chunk[:start] < message_end
+
+        file_descriptors.concat(chunk[:fds])
+        true
+      end
+      file_descriptors
+    end
+
+    def close_pending_unix_fds
+      file_descriptors = @unix_fd_chunks.flat_map { |chunk| chunk[:fds] }
+      file_descriptors.each { |io| io.close unless io.closed? }
+      @unix_fd_chunks.clear
+    end
+
+    def close_unix_fds(file_descriptors)
+      file_descriptors.each { |io| io.close unless io.closed? }
+    end
+
+    def self.finalize_queue(socket, chunks)
+      proc do
+        chunks.flat_map { |chunk| chunk[:fds] }.each { |io| io.close unless io.closed? }
+        next if socket.nil?
+
+        socket.close unless socket.closed?
+      end
+    end
+    private_class_method :finalize_queue
   end
 end
