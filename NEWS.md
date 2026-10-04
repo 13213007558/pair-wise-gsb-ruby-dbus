@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+API:
+ * Add DBus::ObjectManagerMirror, a client-side mirror of a remote
+   org.freedesktop.DBus.ObjectManager. It keeps a local view of the managed
+   objects, their interfaces and properties, initialized from
+   GetManagedObjects and kept up to date with InterfacesAdded,
+   InterfacesRemoved and PropertiesChanged. It tracks NameOwnerChanged for
+   the service name, so a restarted or replaced service gets a fresh view
+   and late signals from a previous owner are ignored. Invalidated
+   properties are kept as unknown and re-fetched on demand.
+
 ## Ruby D-Bus 0.25.0 - 2025-04-03
 
 Bug fixes:
