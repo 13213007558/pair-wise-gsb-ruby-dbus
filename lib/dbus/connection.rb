@@ -27,7 +27,11 @@ module DBus
     # e.g. "unix:path=/tmp/dbus-test" or "tcp:host=localhost,port=2687"
     def initialize(path)
       @message_queue = MessageQueue.new(path)
+      initialize_connection_state
+    end
 
+    # @api private
+    def initialize_connection_state
       # @return [Hash{Integer => Proc}]
       #   key: message serial
       #   value: block to be run when the reply to that message is received
