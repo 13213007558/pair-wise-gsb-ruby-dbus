@@ -324,10 +324,33 @@ module DBus
       end
     end
 
-    # Unix file descriptor, not implemented yet.
+    # Unix file descriptor.
+    #
+    # The plain Ruby value for this type is an IO. During sending the library
+    # keeps a reference to that IO but does not take responsibility for
+    # closing it; the caller does. A received UNIX_FD is owned by the
+    # resulting Message and exposed to the caller as an IO.
     class UnixFD < UInt32
+      # @return [IO,nil] the descriptor represented by this exact value
+      attr_reader :io
+
       def self.type_code
         "h"
+      end
+
+      # @param value [Integer,IO,DBus::Data::UnixFD]
+      def initialize(value)
+        if value.is_a?(self.class)
+          @io = value.io
+          return super(value.value)
+        end
+
+        value = value.to_io if value.respond_to?(:to_io)
+        if value.is_a?(::IO)
+          @io = value
+          value = value.fileno
+        end
+        super(value)
       end
     end
 

@@ -14,6 +14,10 @@ require "socket"
 
 module DBus
   # Encapsulates a socket so that we can {#push} and {#pop} {Message}s.
+  #
+  # While a received message is incomplete, this queue owns the descriptors
+  # received with SCM_RIGHTS. Descriptors for a valid message are transferred
+  # to the Message; descriptors of invalid or unreferenced messages are closed.
   class MessageQueue
     # The socket that is used to connect with the bus.
     attr_reader :socket
@@ -21,15 +25,24 @@ module DBus
     # The buffer size for messages.
     MSG_BUF_SIZE = 4096
 
-    def initialize(address)
+    # @param address [String,nil]
+    # @param socket [IO,nil] an already connected socket for tests or peers
+    # @param unix_fd [Boolean] whether Unix FD passing was negotiated
+    def initialize(address = nil, socket: nil, unix_fd: false)
       DBus.logger.debug "MessageQueue: #{address}"
       @address = address
       @buffer = ""
       # Reduce allocations by using a single buffer for our socket
       @read_buffer = String.new(capacity: MSG_BUF_SIZE)
       @is_tcp = false
+      @unix_fd = unix_fd
       @mutex = Mutex.new
-      connect
+      @socket = socket
+      connect if @socket.nil?
+
+      # Entries are [stream_offset, Array<IO>]
+      @received_fd_groups = []
+      @consumed_bytes = 0
     end
 
     # @param blocking [Boolean]
@@ -59,7 +72,16 @@ module DBus
 
     def push(message)
       @mutex.synchronize do
-        @socket.write(message.marshall)
+        packet = message.marshall
+        if message.unix_fds.empty?
+          @socket.write(packet)
+        elsif !@unix_fd || @socket.closed?
+          raise IOError, "UNIX_FD passing was not negotiated for this connection"
+        else
+        fds = message.unix_fds
+        control = Socket::AncillaryData.unix_rights(*fds)
+          @socket.sendmsg(packet, 0, nil, control)
+        end
       end
     end
     alias << push
@@ -143,6 +165,7 @@ module DBus
     def init_connection
       client = Authentication::Client.new(@socket)
       client.authenticate
+      @unix_fd = client.unix_fd
     end
 
     public # FIXME: fix Main loop instead
@@ -154,10 +177,34 @@ module DBus
 
       ret = nil
       begin
-        ret, size = Message.new.unmarshall_buffer(@buffer)
+        size, fd_count = Message.frame_info(@buffer)
+        return nil if @buffer.bytesize < size
+
+        group_offset = @consumed_bytes
+        groups = fd_groups_for_frame(group_offset, size)
+        received_fds = groups.flat_map(&:last)
+        if fd_count != received_fds.size
+          drop_invalid_message(
+            InvalidPacketException,
+            "UNIX_FDS header says #{fd_count}, received #{received_fds.size}"
+          )
+        end
+
+        ret, consumed = Message.new.unmarshall_buffer(@buffer, unix_fds: received_fds)
+        unless consumed == size
+          drop_invalid_message(
+            InvalidPacketException,
+            "Declared frame size #{size} differs from parsed size #{consumed}"
+          )
+        end
+
         @buffer.slice!(0, size)
+        @consumed_bytes += size
+        @received_fd_groups -= groups
       rescue IncompleteBufferException
         # fall through, let ret remain nil
+      rescue InvalidPacketException
+        drop_current_invalid_message
       end
       ret
     end
@@ -167,7 +214,25 @@ module DBus
     # @return [void]
     # @raise EOFError
     def buffer_from_socket_nonblock
-      @buffer += @socket.read_nonblock(MSG_BUF_SIZE, @read_buffer)
+      if @socket.is_a?(Socket) && @socket.local_address.afamily == Socket::AF_UNIX
+        data, _addr, _flags, *controls = recvmsg_nonblock_with_rights
+        case data
+        when ""
+          return
+        when :wait_readable
+          return
+        when nil
+          close_received_fds
+          raise EOFError
+        end
+
+        @buffer += data
+        group_start = @consumed_bytes + @buffer.bytesize - data.bytesize
+        fds = received_fds_from_controls(controls)
+        @received_fd_groups << [group_start, fds]
+      else
+        @buffer += @socket.read_nonblock(MSG_BUF_SIZE, @read_buffer)
+      end
     rescue EOFError
       raise # the caller expects it
     rescue Errno::EAGAIN
@@ -178,6 +243,46 @@ module DBus
 
       puts "WARNING: read_nonblock failed, falling back to .recv"
       @buffer += @socket.recv(MSG_BUF_SIZE)
+    end
+
+    def recvmsg_nonblock_with_rights
+      @socket.recvmsg_nonblock(MSG_BUF_SIZE, exception: false, scm_rights: true)
+    rescue ArgumentError
+      @socket.recvmsg_nonblock(MSG_BUF_SIZE, exception: false)
+    end
+
+    def received_fds_from_controls(controls)
+      controls.select do |control|
+        control.is_a?(Socket::AncillaryData) &&
+          control.cmsg_is?(:SOCKET, :SCM_RIGHTS)
+      end.flat_map(&:unix_rights).each do |fd|
+        fd.fcntl(Fcntl::F_SETFD, Fcntl::FD_CLOEXEC)
+      end
+    end
+
+    def close_received_fds
+      @received_fd_groups.each do |_offset, fds|
+        fds.each(&:close)
+      end
+      @received_fd_groups.clear
+    end
+
+    def fd_groups_for_frame(offset, size)
+      @received_fd_groups.select do |fd_offset, _|
+        fd_offset >= offset && fd_offset < offset + size
+      end
+    end
+
+    def drop_current_invalid_message
+      close_received_fds
+      @socket.close unless @socket.closed?
+      raise
+    end
+
+    def drop_invalid_message(exception_class, message)
+      close_received_fds
+      @socket.close unless @socket.closed?
+      raise exception_class, message
     end
   end
 end

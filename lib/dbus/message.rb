@@ -50,6 +50,9 @@ module DBus
     # performed.
     NO_AUTO_START = 0x2
 
+    # Header carrying the number of UNIX_FDs accompanying the message.
+    UNIX_FDS = 9
+
     # The type of the message.
     attr_reader :message_type
     # The path of the object instance the message must be sent to/is sent from.
@@ -78,6 +81,11 @@ module DBus
     # The parameters of the message.
     attr_reader :params
 
+    # @return [Array<IO>] UNIX_FDs referenced by this message.
+    #   A sent message only refers to the caller's descriptors and does not
+    #   own them. A received message owns the descriptors it exposes.
+    attr_reader :unix_fds
+
     # Create a message with message type _mtype_ with default values and a
     # unique serial number.
     def initialize(mtype = INVALID)
@@ -92,6 +100,8 @@ module DBus
         @@serial += 1
       end
       @params = []
+      @unix_fds = []
+      @owns_unix_fds = false
       @destination = nil
       @interface = nil
       @error_name = nil
@@ -169,11 +179,13 @@ module DBus
         raise "Cannot send a message with the reserved path #{RESERVED_PATH}: #{inspect}"
       end
 
-      params_marshaller = PacketMarshaller.new(endianness: ENDIANNESS)
+      params_marshaller = PacketMarshaller.new(endianness: ENDIANNESS, unix_fds: [])
       @params.each do |type, value|
         params_marshaller.append(type, value)
       end
       @body_length = params_marshaller.packet.bytesize
+      @unix_fds = params_marshaller.unix_fds
+      @owns_unix_fds = false
 
       marshaller = PacketMarshaller.new(endianness: ENDIANNESS)
       marshaller.append(Type::BYTE, ENDIANNESS_CHAR.ord)
@@ -192,6 +204,7 @@ module DBus
       headers << [DESTINATION,  ["s", @destination]]  if @destination
       #           SENDER is not sent, the message bus fills it in instead
       headers << [SIGNATURE,    ["g", @signature]]    if @signature != ""
+      headers << [UNIX_FDS,     ["u", @unix_fds.size]] unless @unix_fds.empty?
       marshaller.append("a(yv)", headers)
 
       marshaller.align(8)
@@ -205,11 +218,13 @@ module DBus
     # @return [Array(Message,Integer)]
     #   the detected message (self) and
     #   the index pointer of the buffer where the message data ended.
-    def unmarshall_buffer(buf)
+    def unmarshall_buffer(buf, unix_fds: [])
+      @owns_unix_fds = true
       pu = PacketUnmarshaller.new(buf, RawMessage.endianness(buf[0]))
       mdata = pu.unmarshall(MESSAGE_SIGNATURE)
       _, @message_type, @flags, @protocol, @body_length, @serial,
         headers = mdata
+      unix_fd_count = nil
 
       headers.each do |struct|
         case struct[0]
@@ -229,13 +244,67 @@ module DBus
           @sender = struct[1]
         when SIGNATURE
           @signature = struct[1]
+        when UNIX_FDS
+          unless unix_fd_count.nil?
+            raise InvalidPacketException, "UNIX_FDS header appears more than once"
+          end
+
+          unix_fd_count = struct[1]
         end
       end
+      unix_fd_count ||= 0
+      if unix_fd_count != unix_fds.size
+        raise InvalidPacketException,
+              "UNIX_FDS header says #{unix_fd_count}, received #{unix_fds.size}"
+      end
+
+      pu.unix_fds = unix_fds
       pu.align_body
       if @body_length.positive? && @signature
-        @params = pu.unmarshall(@signature, @body_length)
+        begin
+          @params = pu.unmarshall(@signature, @body_length)
+        rescue Exception
+          unix_fds.each(&:close)
+          raise
+        end
       end
+      pu.close_unreferenced_unix_fds
+      @unix_fds = pu.referenced_unix_fds.uniq
       [self, pu.consumed_size]
+    end
+
+    # @return [Boolean] whether this message owns received UNIX_FDs
+    def owns_unix_fds?
+      @owns_unix_fds
+    end
+
+    # Close UNIX_FDs owned by a received message. Sent messages do not own
+    # the caller's original descriptors, so this is a no-op for them.
+    # @return [void]
+    def close_unix_fds
+      return unless @owns_unix_fds
+
+      @unix_fds.each(&:close)
+      @unix_fds.clear
+    end
+
+    # Return the complete frame size and its UNIX_FDS header value.
+    # @param buf [String]
+    # @return [Array(Integer,Integer)]
+    def self.frame_info(buf)
+      raise IncompleteBufferException if buf.bytesize < 16
+
+      pu = PacketUnmarshaller.new(buf, RawMessage.endianness(buf[0]))
+      _, _message_type, _flags, _protocol, body_length, _serial, headers =
+        pu.unmarshall(MESSAGE_SIGNATURE)
+      pu.align_body
+
+      counts = headers.select { |code, _| code == UNIX_FDS }.map { |_code, value| value }
+      if counts.size > 1
+        raise InvalidPacketException, "UNIX_FDS header appears more than once"
+      end
+
+      [pu.consumed_size + body_length, counts.first || 0]
     end
 
     # Make a new exception from ex, mark it as being caused by this message

@@ -33,11 +33,12 @@ module DBus
     # Create a new unmarshaller for the given data *buffer*.
     # @param buffer [String]
     # @param endianness [:little,:big]
-    def initialize(buffer, endianness)
+    def initialize(buffer, endianness, unix_fds: nil)
       # TODO: this dup can be avoided if we can prove
       # that an IncompleteBufferException leaves the original *buffer* intact
       buffer = buffer.dup
       @raw_msg = RawMessage.new(buffer, endianness)
+      self.unix_fds = unix_fds
     end
 
     # Unmarshall the buffer for a given _signature_ and length _len_.
@@ -72,6 +73,25 @@ module DBus
       @raw_msg.pos
     end
 
+    # @return [Array<IO>] FDs referenced while unmarshalling
+    attr_reader :referenced_unix_fds
+
+    # Assign the FDs carried by this message. UNIX_FD indexes in the data are
+    # resolved against this array.
+    # @param fds [Array<IO>,nil]
+    def unix_fds=(fds)
+      @unix_fds = fds
+      @referenced_unix_fds = []
+    end
+
+    # Close received FDs that were not referenced by any UNIX_FD value.
+    # @return [void]
+    def close_unreferenced_unix_fds
+      return if @unix_fds.nil?
+
+      (@unix_fds - @referenced_unix_fds).each(&:close)
+    end
+
     private
 
     # @param data_class [Class] a subclass of Data::Base (specific?)
@@ -97,7 +117,18 @@ module DBus
               "sigtype: #{signature.sigtype} (#{signature.sigtype.chr})"
       end
 
-      if data_class.fixed?
+      if data_class == Data::UnixFD && !@unix_fds.nil?
+        raw_index = aligned_read_value(Data::UInt32)
+        if raw_index >= @unix_fds.size
+          range = @unix_fds.empty? ? "no descriptors" : "0...#{@unix_fds.size - 1}"
+          raise InvalidPacketException,
+                "UNIX_FD index #{raw_index} is out of range (#{range})"
+        end
+
+        io = @unix_fds[raw_index]
+        @referenced_unix_fds << io
+        packet = mode == :plain ? io : Data::UnixFD.new(io)
+      elsif data_class.fixed?
         value = aligned_read_value(data_class)
         packet = data_class.from_raw(value, mode: mode)
       elsif data_class.basic?
@@ -164,15 +195,19 @@ module DBus
     # @return [String]
     attr_reader :packet
 
+    # @return [Array<IO>,nil]
+    attr_reader :unix_fds
+
     # @return [:little,:big]
     attr_reader :endianness
 
     # Create a new marshaller, setting the current packet to the
     # empty packet.
-    def initialize(offset = 0, endianness: HOST_ENDIANNESS)
+    def initialize(offset = 0, endianness: HOST_ENDIANNESS, unix_fds: nil)
       @endianness = endianness
       @packet = ""
       @offset = offset # for correct alignment of nested marshallers
+      @unix_fds = unix_fds
     end
 
     # Round _num_ up to the specified power of two, _alignment_
@@ -233,7 +268,16 @@ module DBus
               "sigtype: #{type.sigtype} (#{type.sigtype.chr})"
       end
 
-      if data_class.fixed?
+      if data_class == Data::UnixFD && !@unix_fds.nil?
+        io = unix_fd_io(val)
+        align(Data::UnixFD.alignment)
+        index = @unix_fds.index { |existing| existing.fileno == io.fileno }
+        if index.nil?
+          index = @unix_fds.size
+          @unix_fds << io
+        end
+        @packet += Data::UInt32.new(index).marshall(endianness)
+      elsif data_class.fixed?
         align(data_class.alignment)
         data = data_class.new(val)
         @packet += data.marshall(endianness)
@@ -314,7 +358,9 @@ module DBus
 
       append(Data::Signature.type, vartype.to_s)
       align(vartype.alignment)
-      sub = PacketMarshaller.new(@offset + @packet.bytesize, endianness: endianness)
+      sub = PacketMarshaller.new(@offset + @packet.bytesize,
+                                 endianness: endianness,
+                                 unix_fds: @unix_fds)
       sub.append(vartype, vardata)
       @packet += sub.packet
     end
@@ -339,6 +385,26 @@ module DBus
         val.each do |elem|
           append(child_type, elem)
         end
+      end
+    end
+
+    private
+
+    # Return an IO for a value supplied as a UNIX_FD. Integer descriptors are
+    # wrapped without changing their ownership.
+    def unix_fd_io(value)
+      value = value.io if value.is_a?(Data::UnixFD) && !value.io.nil?
+      value = value.value if value.is_a?(Data::UnixFD)
+      value = value.to_io if !value.is_a?(::IO) && value.respond_to?(:to_io)
+
+      case value
+      when ::IO
+        value.autoclose = false if value.respond_to?(:autoclose=)
+        value
+      when ::Integer
+        ::IO.new(value, autoclose: false)
+      else
+        raise TypeError, "UNIX_FD expects an IO or file descriptor, got #{value.class}"
       end
     end
 
