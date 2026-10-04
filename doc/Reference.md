@@ -103,6 +103,24 @@ for properties the interface must be explicitly chosen.
 That is because {DBus::ProxyObject} uses the {DBus::ProxyObject Hash#[]} API
 to provide the {DBus::ProxyObjectInterface interfaces}, not the properties.
 
+#### Watching Managed Objects
+
+For a service implementing
+{https://dbus.freedesktop.org/doc/dbus-specification.html#standard-interfaces-objectmanager
+ObjectManager}, create a mirror from its interface:
+
+    object = service["/org/freedesktop/UPower"]
+    manager = object["org.freedesktop.DBus.ObjectManager"].object_manager
+    p manager.paths
+    p manager.managed_objects
+
+The mirror subscribes to `InterfacesAdded`, `InterfacesRemoved`,
+`PropertiesChanged` and the bus `NameOwnerChanged` signal before taking its
+initial `GetManagedObjects` snapshot. Signals from a former service owner are
+ignored. A property delivered through the invalidated-properties list is stored
+as `:unknown` and is fetched lazily when accessed through
+{DBus::ProxyObjectManager#property}.
+
 #### Asynchronous Operation
 
 If a method call has a block attached, it is asynchronous and the block

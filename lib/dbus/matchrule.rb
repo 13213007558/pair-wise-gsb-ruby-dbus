@@ -86,11 +86,12 @@ module DBus
     # Determines whether a message _msg_ matches the match rule.
     def match(msg)
       return false if @type && @type != msg.message_type_s
+      return false if @sender && @sender != msg.sender
       return false if @interface && @interface != msg.interface
       return false if @member && @member != msg.member
       return false if @path && @path != msg.path
 
-      # FIXME: sender and destination are ignored
+      # FIXME: destination is ignored
       true
     end
   end

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+API:
+ * Add a client-side ObjectManager mirror that maintains a local view of
+   managed paths, interfaces and properties. Invalidated properties are kept as
+   `:unknown` until read on demand, and stale signals from former service
+   owners are ignored.
+
 ## Ruby D-Bus 0.25.0 - 2025-04-03
 
 Bug fixes:

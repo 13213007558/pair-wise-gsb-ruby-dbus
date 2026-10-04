@@ -174,5 +174,12 @@ module DBus
         ret
       end
     end
+
+    # Return a client-side ObjectManager mirror for this interface.
+    # @return [ProxyObjectManager]
+    def object_manager
+      ProxyObjectManager.new(self)
+    end
+    alias object_manager_mirror object_manager
   end
 end

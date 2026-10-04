@@ -37,7 +37,8 @@ module DBus
       #   for debugging only: messages for which a reply was not received yet;
       #   key == value.serial
       @method_call_msgs = {}
-      @signal_matchrules = {}
+      # @return [Hash{String => Array<Proc>}]
+      @signal_matchrules = Hash.new { |hash, key| hash[key] = [] }
     end
 
     def object_server
@@ -254,8 +255,9 @@ module DBus
       # check this is a signal.
       mrs = match_rule.to_s
       DBus.logger.debug "#{@signal_matchrules.size} rules, adding #{mrs.inspect}"
-      rule_existed = @signal_matchrules.key?(mrs)
-      @signal_matchrules[mrs] = slot
+      slots = @signal_matchrules[mrs] ||= []
+      rule_existed = !slots.empty?
+      slots << slot unless slots.include?(slot)
       rule_existed
     end
 
@@ -263,7 +265,8 @@ module DBus
     # @return [void] actually return whether the rule existed, internal detail
     def remove_match(match_rule)
       mrs = match_rule.to_s
-      @signal_matchrules.delete(mrs).nil?
+      slots = @signal_matchrules.delete(mrs)
+      !slots.nil? && !slots.empty?
     end
 
     # @api private
@@ -313,9 +316,9 @@ module DBus
       when DBus::Message::SIGNAL
         # the signal can match multiple different rules
         # clone to allow new signale handlers to be registered
-        @signal_matchrules.dup.each do |mrs, slot|
+        @signal_matchrules.dup.each do |mrs, slots|
           if DBus::MatchRule.new.from_s(mrs).match(msg)
-            slot.call(msg)
+            slots.dup.each { |slot| slot.call(msg) }
           end
         end
       else
